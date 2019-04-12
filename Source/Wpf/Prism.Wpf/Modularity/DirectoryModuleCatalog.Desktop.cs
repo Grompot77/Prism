@@ -54,7 +54,7 @@ namespace Prism.Modularity
                 var assemblies = (
                                      from Assembly assembly in AppDomain.CurrentDomain.GetAssemblies()
                                      where !(assembly is System.Reflection.Emit.AssemblyBuilder)
-										&& assembly.GetType().FullName != "System.Reflection.Emit.InternalAssemblyBuilder"
+                                        && assembly.GetType().FullName != "System.Reflection.Emit.InternalAssemblyBuilder"
                                         && !String.IsNullOrEmpty(assembly.Location)
                                      select assembly.Location
                                  );
@@ -68,7 +68,9 @@ namespace Prism.Modularity
                     var loader =
                         (InnerModuleInfoLoader)
                         childDomain.CreateInstanceFrom(loaderType.Assembly.Location, loaderType.FullName).Unwrap();
+#if NET45 //ajb: no need to load the assemblies if in netcore, since we are using the AppDomain.CurrentDomain and ReflectionOnlyLoadFrom is not platform implemented
                     loader.LoadAssemblies(loadedAssemblies);
+#endif
                     this.Items.AddRange(loader.GetModuleInfos(this.ModulePath));
                 }
             }
@@ -115,13 +117,19 @@ namespace Prism.Modularity
                 DirectoryInfo directory = new DirectoryInfo(path);
 
                 ResolveEventHandler resolveEventHandler =
-                    delegate(object sender, ResolveEventArgs args) { return OnReflectionOnlyResolve(args, directory); };
+                    delegate (object sender, ResolveEventArgs args) { return OnReflectionOnlyResolve(args, directory); };
 
                 AppDomain.CurrentDomain.ReflectionOnlyAssemblyResolve += resolveEventHandler;
 
+                //ajb: again, we work with the GetAssemblies for the loaded appdomain context
                 Assembly moduleReflectionOnlyAssembly =
-                    AppDomain.CurrentDomain.ReflectionOnlyGetAssemblies().First(
-                        asm => asm.FullName == typeof(IModule).Assembly.FullName);
+                    AppDomain.CurrentDomain
+#if NETCOREAPP3_0
+                    .GetAssemblies()
+#else
+                    .ReflectionOnlyGetAssemblies()
+#endif
+                    .First(asm => asm.FullName == typeof(IModule).Assembly.FullName);
                 Type IModuleType = moduleReflectionOnlyAssembly.GetType(typeof(IModule).FullName);
 
                 IEnumerable<ModuleInfo> modules = GetNotAllreadyLoadedModuleInfos(directory, IModuleType);
@@ -133,22 +141,38 @@ namespace Prism.Modularity
 
             private static IEnumerable<ModuleInfo> GetNotAllreadyLoadedModuleInfos(DirectoryInfo directory, Type IModuleType)
             {
-                List<FileInfo> validAssemblies = new List<FileInfo>();
-                Assembly[] alreadyLoadedAssemblies = AppDomain.CurrentDomain.ReflectionOnlyGetAssemblies();
+                //ajb: had to change the temp list to assembly type, it is required for the return select
+                //List<FileInfo> validAssemblies = new List<FileInfo>();
+                List<Assembly> validAssemblies = new List<Assembly>();
+                //ajb: changed to use GetAssemblies with conditional build, exclude where assemblies are IsDynamic for fileInfos will fail
+                Assembly[] alreadyLoadedAssemblies = AppDomain.CurrentDomain
+#if NETCOREAPP3_0
+                    .GetAssemblies().Where(p => !p.IsDynamic).ToArray();
+#else
+                    .ReflectionOnlyGetAssemblies();
+#endif
 
                 var fileInfos = directory.GetFiles("*.dll")
                     .Where(file => alreadyLoadedAssemblies
                                        .FirstOrDefault(
                                        assembly =>
                                        String.Compare(Path.GetFileName(assembly.Location), file.Name,
-                                                      StringComparison.OrdinalIgnoreCase) == 0) == null);
+                                                      StringComparison.OrdinalIgnoreCase) == 0) == null).ToList();
 
                 foreach (FileInfo fileInfo in fileInfos)
                 {
                     try
                     {
-                        Assembly.ReflectionOnlyLoadFrom(fileInfo.FullName);
-                        validAssemblies.Add(fileInfo);
+                        //ajb: add to new collection inline
+                        //Assembly.ReflectionOnlyLoadFrom(fileInfo.FullName);
+                        validAssemblies.Add(
+#if NETCOREAPP3_0
+                        Assembly.LoadFrom(fileInfo.FullName)
+#else
+                        Assembly.ReflectionOnlyLoadFrom(fileInfo.FullName)
+#endif
+                            );
+                        //validAssemblies.Add(fileInfo);
                     }
                     catch (BadImageFormatException)
                     {
@@ -156,12 +180,21 @@ namespace Prism.Modularity
                     }
                 }
 
-                return validAssemblies.SelectMany(file => Assembly.ReflectionOnlyLoadFrom(file.FullName)
-                                            .GetExportedTypes()
-                                            .Where(IModuleType.IsAssignableFrom)
-                                            .Where(t => t != IModuleType)
-                                            .Where(t => !t.IsAbstract)
-                                            .Select(type => CreateModuleInfo(type)));
+                //ajb: changed to use the new temp collection
+                return validAssemblies.SelectMany(assembly => assembly
+                            .GetExportedTypes()
+                            .Where(IModuleType.IsAssignableFrom)
+                            .Where(t => t != IModuleType)
+                            .Where(t => !t.IsAbstract)
+                            .Select(type => CreateModuleInfo(type)));
+
+                //return validAssemblies.SelectMany(file => Assembly
+                //                            .ReflectionOnlyLoadFrom(file.FullName)
+                //                            .GetExportedTypes()
+                //                            .Where(IModuleType.IsAssignableFrom)
+                //                            .Where(t => t != IModuleType)
+                //                            .Where(t => !t.IsAbstract)
+                //                            .Select(type => CreateModuleInfo(type)));
             }
 
             private static Assembly OnReflectionOnlyResolve(ResolveEventArgs args, DirectoryInfo directory)
@@ -214,15 +247,15 @@ namespace Prism.Modularity
                         switch (argumentName)
                         {
                             case "ModuleName":
-                                moduleName = (string) argument.TypedValue.Value;
+                                moduleName = (string)argument.TypedValue.Value;
                                 break;
 
                             case "OnDemand":
-                                onDemand = (bool) argument.TypedValue.Value;
+                                onDemand = (bool)argument.TypedValue.Value;
                                 break;
 
                             case "StartupLoaded":
-                                onDemand = !((bool) argument.TypedValue.Value);
+                                onDemand = !((bool)argument.TypedValue.Value);
                                 break;
                         }
                     }
@@ -234,17 +267,17 @@ namespace Prism.Modularity
 
                 foreach (CustomAttributeData cad in moduleDependencyAttributes)
                 {
-                    dependsOn.Add((string) cad.ConstructorArguments[0].Value);
+                    dependsOn.Add((string)cad.ConstructorArguments[0].Value);
                 }
 
                 ModuleInfo moduleInfo = new ModuleInfo(moduleName, type.AssemblyQualifiedName)
-                                            {
-                                                InitializationMode =
+                {
+                    InitializationMode =
                                                     onDemand
                                                         ? InitializationMode.OnDemand
                                                         : InitializationMode.WhenAvailable,
-                                                Ref = type.Assembly.EscapedCodeBase,
-                                            };
+                    Ref = type.Assembly.EscapedCodeBase,
+                };
                 moduleInfo.DependsOn.AddRange(dependsOn);
                 return moduleInfo;
             }
